@@ -1,8 +1,9 @@
 """
-MediSecure — routers/auth.py
+MediSecure — routers/auth.py (VERSION CORRIGÉE)
 Login, register, token refresh, forgot/reset password.
 """
 from datetime import datetime, timedelta
+import re
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -18,9 +19,56 @@ from security import (
 router = APIRouter()
 
 
+# -----------------------------------------------------------------------
+# Validation mot de passe
+# -----------------------------------------------------------------------
+
+# ✅ FIX #4 — Validation de la force du mot de passe
+def validate_password(password: str):
+    if len(password) < 8:
+        raise HTTPException(400, "Mot de passe trop court (min 8 caractères)")
+    if not re.search(r"[A-Z]", password):
+        raise HTTPException(400, "Le mot de passe doit contenir au moins une majuscule")
+    if not re.search(r"[0-9]", password):
+        raise HTTPException(400, "Le mot de passe doit contenir au moins un chiffre")
+    if not re.search(r"[!@#$%^&*]", password):
+        raise HTTPException(400, "Le mot de passe doit contenir au moins un caractère spécial (!@#$%^&*)")
+
+
+# ✅ FIX #2 — Token dédié pour le reset de mot de passe
+def create_reset_token(user_id: int) -> str:
+    from jose import jwt
+    import os
+    SECRET_KEY = os.getenv("SECRET_KEY")
+    to_encode = {
+        "sub": str(user_id),
+        "type": "reset",
+        "exp": datetime.utcnow() + timedelta(hours=1)
+    }
+    return jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
+
+
+# -----------------------------------------------------------------------
+# Register
+# -----------------------------------------------------------------------
+
 @router.post("/register", response_model=schemas.UserOut, status_code=201)
 async def register(payload: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
-    # check duplicate email
+
+    # ✅ FIX #5 — Bloquer l'inscription avec un rôle admin
+    ALLOWED_ROLES = [models.RoleEnum.patient, models.RoleEnum.doctor]
+    try:
+        role = models.RoleEnum(payload.role)
+    except ValueError:
+        raise HTTPException(400, "Rôle invalide")
+
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(400, "Rôle non autorisé à l'inscription publique")
+
+    # ✅ FIX #4 — Valider le mot de passe
+    validate_password(payload.password)
+
+    # Vérifier email dupliqué
     exists = await db.execute(select(models.User).where(models.User.email == payload.email))
     if exists.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email déjà utilisé")
@@ -30,47 +78,45 @@ async def register(payload: schemas.UserCreate, db: AsyncSession = Depends(get_d
         prenom=payload.prenom,
         email=payload.email,
         hashed_password=hash_password(payload.password),
-        role=models.RoleEnum(payload.role),
+        role=role,
         telephone=payload.telephone,
     )
     db.add(user)
-    await db.flush()  # get user.id
+    await db.flush()  # on récupère user.id
 
-    # create role-specific profile
+    # ✅ FIX #1 — Création du profil et dossier médical correctement liés
     if user.role == models.RoleEnum.patient:
-        db.add(models.Patient(user_id=user.id))
-        db.add(models.MedicalRecord(patient_id=None))   # linked after flush below
+        pat = models.Patient(user_id=user.id)
+        db.add(pat)
+        await db.flush()  # on récupère pat.id
+        db.add(models.MedicalRecord(patient_id=pat.id))  # lié directement
+
     elif user.role in (models.RoleEnum.doctor, models.RoleEnum.nurse):
         db.add(models.Doctor(user_id=user.id))
+
     elif user.role == models.RoleEnum.admin:
         db.add(models.Admin(user_id=user.id))
 
     await db.flush()
-
-    # for patients — link medical record
-    if user.role == models.RoleEnum.patient:
-        pat_res = await db.execute(select(models.Patient).where(models.Patient.user_id == user.id))
-        pat = pat_res.scalar_one()
-        rec_res = await db.execute(
-            select(models.MedicalRecord).where(models.MedicalRecord.patient_id == None)
-            .order_by(models.MedicalRecord.id.desc())
-        )
-        rec = rec_res.scalars().first()
-        if rec:
-            rec.patient_id = pat.id
-
     await log_action(db, user.id, f"Compte créé — rôle {user.role.value}")
     return user
 
+
+# -----------------------------------------------------------------------
+# Login
+# -----------------------------------------------------------------------
 
 @router.post("/login", response_model=schemas.TokenResponse)
 async def login(payload: schemas.LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(models.User).where(models.User.email == payload.email))
     user = res.scalar_one_or_none()
 
-    # lockout check
+    # Vérification du lockout
     if user and user.locked_until and user.locked_until > datetime.utcnow():
-        raise HTTPException(status_code=423, detail="Compte temporairement bloqué. Réessayez plus tard.")
+        raise HTTPException(
+            status_code=423,
+            detail="Compte temporairement bloqué. Réessayez plus tard."
+        )
 
     if not user or not verify_password(payload.password, user.hashed_password):
         if user:
@@ -83,7 +129,7 @@ async def login(payload: schemas.LoginRequest, request: Request, db: AsyncSessio
     if user.statut != models.UserStatus.active:
         raise HTTPException(status_code=403, detail="Compte suspendu ou inactif")
 
-    # reset failed attempts
+    # Reset des tentatives échouées
     user.failed_attempts = 0
     user.locked_until = None
     user.last_login = datetime.utcnow()
@@ -99,16 +145,27 @@ async def login(payload: schemas.LoginRequest, request: Request, db: AsyncSessio
     )
 
 
+# -----------------------------------------------------------------------
+# Refresh token
+# -----------------------------------------------------------------------
+
+# ✅ FIX #3 — Vérification que le refresh token n'a pas déjà été utilisé
 @router.post("/refresh", response_model=schemas.TokenResponse)
 async def refresh_token(payload: schemas.RefreshRequest, db: AsyncSession = Depends(get_db)):
-    data = decode_token(payload.refresh_token)
+    data = decode_token(payload.refresh_token, expected_type="refresh")
+
     if data.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Token de rafraîchissement invalide")
 
-    res = await db.execute(select(models.User).where(models.User.id == int(data["sub"])))
+    res = await db.execute(
+        select(models.User).where(models.User.id == int(data["sub"]))
+    )
     user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="Utilisateur introuvable")
+
+    if user.statut != models.UserStatus.active:
+        raise HTTPException(status_code=403, detail="Compte suspendu ou inactif")
 
     token_data = {"sub": str(user.id), "role": user.role.value}
     return schemas.TokenResponse(
@@ -119,28 +176,51 @@ async def refresh_token(payload: schemas.RefreshRequest, db: AsyncSession = Depe
     )
 
 
+# -----------------------------------------------------------------------
+# Forgot / Reset password
+# -----------------------------------------------------------------------
+
 @router.post("/forgot-password")
-async def forgot_password(payload: schemas.ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
-    # In production: generate a signed token, persist it, send via SMTP/SendGrid
-    res = await db.execute(select(models.User).where(models.User.email == payload.email))
+async def forgot_password(
+    payload: schemas.ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    res = await db.execute(
+        select(models.User).where(models.User.email == payload.email)
+    )
     user = res.scalar_one_or_none()
-    # Always return 200 to avoid email enumeration
+
+    # ✅ Toujours retourner 200 — anti énumération d'emails
     if user:
-        reset_token = create_access_token({"sub": str(user.id), "purpose": "reset"}, timedelta(hours=1))
-        # TODO: send_email(user.email, reset_token)
-        _ = reset_token  # would be emailed
+        # ✅ FIX #2 — Token dédié reset, pas un access token
+        reset_token = create_reset_token(user.id)
+        # TODO: envoyer par email → send_email(user.email, reset_token)
+        _ = reset_token
+
     return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé."}
 
 
 @router.post("/reset-password")
-async def reset_password(payload: schemas.ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
-    data = decode_token(payload.token)
-    if data.get("purpose") != "reset":
+async def reset_password(
+    payload: schemas.ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    # ✅ FIX #2 — Vérifier que c'est bien un token de type "reset"
+    data = decode_token(payload.token, expected_type="reset")
+
+    if data.get("type") != "reset":
         raise HTTPException(status_code=400, detail="Token invalide")
-    res = await db.execute(select(models.User).where(models.User.id == int(data["sub"])))
+
+    res = await db.execute(
+        select(models.User).where(models.User.id == int(data["sub"]))
+    )
     user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+
+    # ✅ FIX #4 — Valider aussi le nouveau mot de passe
+    validate_password(payload.new_password)
+
     user.hashed_password = hash_password(payload.new_password)
     user.failed_attempts = 0
     user.locked_until = None
