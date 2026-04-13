@@ -32,3 +32,5 @@ ios/.symlinks/
 ios/Flutter/Flutter.framework
 ios/Flutter/Flutter.podspec
 .DS_Store
+
+backend/.env
